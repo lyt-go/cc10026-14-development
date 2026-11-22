@@ -277,3 +277,138 @@ def list_module_snapshots() -> list[dict[str, Any]]:
             if snap:
                 snapshots.append(snap)
     return snapshots
+
+
+# ========== SLA 历史事件 ==========
+
+
+def read_sla_event_records() -> list[dict[str, Any]]:
+    """读取用于分类重算的历史 SLA 事件明细。
+
+    优先使用 data/sla_events/records.json（采集侧落盘的全量明细）；
+    没有落盘文件时退回内置示例数据，保证克隆下来即可复算。
+    """
+    from app.domain_seed import SLA_EVENT_RECORDS
+
+    stored = _read_json(DATA_ROOT / "sla_events" / "records.json", None)
+    if isinstance(stored, list) and stored:
+        return [dict(row) for row in stored]
+    return [dict(row) for row in SLA_EVENT_RECORDS]
+
+
+def write_sla_event_records(records: list[dict[str, Any]]) -> None:
+    """采集侧写入历史事件明细，供后续重算复用。"""
+    _write_json(DATA_ROOT / "sla_events" / "records.json", [dict(r) for r in records])
+
+
+# ========== 分类版本时间线 ==========
+
+
+def read_classification_versions() -> list[dict[str, Any]]:
+    """读取分类版本快照；落盘版本覆盖内置版本，按生效时间排序。"""
+    from app.domain_seed import CLASSIFICATION_VERSIONS
+
+    versions = {v["version"]: dict(v) for v in CLASSIFICATION_VERSIONS}
+    stored = _read_json(DATA_ROOT / "error_classify" / "versions.json", [])
+    if isinstance(stored, list):
+        for item in stored:
+            if isinstance(item, dict) and item.get("version"):
+                versions[str(item["version"])] = item
+    ordered = sorted(versions.values(), key=lambda v: str(v.get("effective_from", "")))
+    return ordered
+
+
+def write_classification_version(version: dict[str, Any]) -> dict[str, Any]:
+    """登记或更新一个分类版本（含该版本的错误码规则快照）。"""
+    stored = _read_json(DATA_ROOT / "error_classify" / "versions.json", [])
+    if not isinstance(stored, list):
+        stored = []
+    stored = [
+        item for item in stored
+        if not (isinstance(item, dict) and item.get("version") == version.get("version"))
+    ]
+    stored.append(version)
+    stored.sort(key=lambda v: str(v.get("effective_from", "")))
+    _write_json(DATA_ROOT / "error_classify" / "versions.json", stored)
+    return version
+
+
+# ========== 分类重算运行记录 ==========
+
+
+def _recompute_path(run_id: int) -> Path:
+    return DATA_ROOT / "recompute" / f"{run_id:06d}.json"
+
+
+def write_recompute(run: dict[str, Any]) -> None:
+    run["_updated_at"] = _now_iso()
+    _write_json(_recompute_path(int(run["run_id"])), run)
+
+
+def read_recompute(run_id: int) -> dict[str, Any]:
+    return _read_json(_recompute_path(int(run_id)), {})
+
+
+def list_recomputes() -> list[dict[str, Any]]:
+    _ensure_dir(DATA_ROOT / "recompute")
+    runs = []
+    for f in sorted(DATA_ROOT.glob("recompute/[0-9]*.json")):
+        record = _read_json(f)
+        if record:
+            runs.append(record)
+    return runs
+
+
+def next_recompute_id() -> int:
+    _ensure_dir(DATA_ROOT / "recompute")
+    return max((int(f.stem) for f in DATA_ROOT.glob("recompute/[0-9]*.json")), default=0) + 1
+
+
+# ========== 已交付的 SLA 报告 ==========
+
+
+def _report_path(report_id: str) -> Path:
+    safe = "".join(ch for ch in str(report_id) if ch.isalnum() or ch in "-_")
+    return DATA_ROOT / "reports" / f"{safe}.json"
+
+
+def _ensure_report_seeds() -> None:
+    """首次读取时把内置历史报告落盘，之后保持不变供事后核对。"""
+    from app.domain_seed import DELIVERED_REPORTS
+
+    for report in DELIVERED_REPORTS:
+        path = _report_path(report["report_id"])
+        if not path.exists():
+            _write_json(path, dict(report))
+
+
+def list_sla_reports() -> list[dict[str, Any]]:
+    _ensure_report_seeds()
+    _ensure_dir(DATA_ROOT / "reports")
+    reports = []
+    for f in sorted(DATA_ROOT.glob("reports/*.json")):
+        record = _read_json(f)
+        if record:
+            reports.append(record)
+    return reports
+
+
+def read_sla_report(report_id: str) -> dict[str, Any]:
+    _ensure_report_seeds()
+    return _read_json(_report_path(report_id), {})
+
+
+def write_sla_report(report: dict[str, Any]) -> None:
+    _write_json(_report_path(str(report.get("report_id", "unknown"))), report)
+
+
+# ========== SLA监控对分类重算的消费记录 ==========
+
+
+def write_recompute_consumption(run_id: int, consumption: dict[str, Any]) -> None:
+    consumption["_consumed_at"] = _now_iso()
+    _write_json(DATA_ROOT / "sla_monitor" / f"recompute_{int(run_id):06d}.json", consumption)
+
+
+def read_recompute_consumption(run_id: int) -> dict[str, Any]:
+    return _read_json(DATA_ROOT / "sla_monitor" / f"recompute_{int(run_id):06d}.json", {})

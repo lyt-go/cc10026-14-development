@@ -4,11 +4,16 @@
 - 消费 sla_monitor 快照 → SLA偏离事件触发异常归类
 - 消费 call_audit 快照 → 审计异常调用触发归类
 - 归类结果供 query_route 降级路由决策
+- 历史事件批量归类 → sla_recompute 按事件原时间窗口重算
+
+单条归类默认采用最新生效的分类版本；需要复核历史事件时，用
+``classify(..., at=事件时间)`` 取事件发生当时生效的版本。
 """
 from __future__ import annotations
 
 from typing import Any
 
+from app.services import recompute_engine as engine
 from app.services.base import BaseModuleService
 from app.store import store
 
@@ -23,8 +28,53 @@ class ErrorClassifyService(BaseModuleService):
     ACTION_RULES = {"提交校验": "待校验", "标记生效": "已生效", "停用分类": "已停用"}
     NEGATIVE_ACTIONS = ["停用分类"]
 
-    def classify(self, error_code: str, error_message: str = "") -> dict[str, Any]:
-        """根据错误码进行异常归类。"""
+    def classify(
+        self,
+        error_code: str,
+        error_message: str = "",
+        *,
+        at: str | None = None,
+        version: str | None = None,
+    ) -> dict[str, Any]:
+        """根据错误码进行异常归类。
+
+        - 默认按最新登记的分类版本匹配；
+        - 传 ``at`` 时按该时间点生效的版本匹配（历史事件复核）；
+        - 传 ``version`` 时锁定指定版本。
+        """
+        from app.services.data_manager import read_classification_versions
+
+        versions = read_classification_versions()
+        if version:
+            target = next(
+                (v for v in versions if str(v.get("version")) == str(version)), None)
+        elif at:
+            target = engine.resolve_version(at, versions)
+        else:
+            target = engine.latest_version(versions)
+
+        if target is not None:
+            rule = engine.match_rule(error_code, target.get("rules", []))
+            if rule is None:
+                return {
+                    "matched": False,
+                    "error_code": error_code,
+                    "error_message": error_message,
+                    "classification_version": target.get("version"),
+                }
+            return {
+                "matched": True,
+                "type_name": rule.get("type_name") or rule.get("类型名称"),
+                "severity": rule.get("severity") or rule.get("分级策略"),
+                "retry_advice": rule.get("retry") or rule.get("重试建议"),
+                "circuit_breaker": rule.get("breaker") or rule.get("熔断阈值"),
+                "notify": rule.get("notify") or rule.get("通知方式"),
+                "error_code": error_code,
+                "error_message": error_message,
+                "classification_version": target.get("version"),
+            }
+
+        # 没有版本登记表时退回内存规则表（兼容仅维护规则行的部署）
         rows = store.rows(self.MODULE)
         active_classifications = [r for r in rows if r.get("status") == "已生效"]
 
@@ -51,6 +101,7 @@ class ErrorClassifyService(BaseModuleService):
                     "notify": row.get("通知方式"),
                     "error_code": error_code,
                     "error_message": error_message,
+                    "classification_version": row.get("分类版本"),
                 }
         return {"matched": False, "error_code": error_code, "error_message": error_message}
 
@@ -109,4 +160,7 @@ class ErrorClassifyService(BaseModuleService):
             "count": len(classify_list),
             "classifications": classify_list,
             "active_count": sum(1 for r in classify_list if r.get("status") == "已生效"),
+            "versions": sorted({
+                str(r.get("version")) for r in classify_list if r.get("version")
+            }),
         }
